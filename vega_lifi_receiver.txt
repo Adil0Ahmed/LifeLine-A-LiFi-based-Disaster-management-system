@@ -1,0 +1,519 @@
+/*
+ * ============================================
+ *  Li-Fi Receiver for Vega Aries Board
+ * ============================================
+ * 
+ * Vega Aries Board Information:
+ * - Developed by C-DAC and IIT Madras (Made in India)
+ * - Based on RISC-V Vega ET1031 processor
+ * - Arduino Uno compatible (use Arduino board settings)
+ * - Operating Voltage: 3.3V/5V
+ * - Analog Input: 10-bit ADC (0-1023 range)
+ * - Analog Reference: 5V (default)
+ * 
+ * Project: Li-Fi Alert System
+ * Purpose: Receive and decode alert messages from LED light pulses
+ * Data Rate: 100 bits per second (must match transmitter)
+ * 
+ * Hardware Setup:
+ * ================
+ * Vega Aries Board (Receiver)
+ * - 5V → LDR (one terminal)
+ * - LDR (other terminal) → A0 pin
+ * - A0 pin → 10kΩ resistor → GND
+ * - USB cable for power and serial monitor
+ * 
+ * Circuit Explanation (Voltage Divider):
+ * Light increases → LDR resistance decreases → A0 voltage increases
+ * Dark increases → LDR resistance increases → A0 voltage decreases
+ * 
+ * LDR Specifications:
+ * - Type: GL5528 or similar (commonly available in India)
+ * - Resistance Range: 10kΩ (dark) to 1kΩ (bright)
+ * - Response Time: 20-30ms (typical)
+ * - Available at local electronics shops (~₹5-10)
+ * 
+ * Upload Instructions:
+ * ====================
+ * 1. Open Arduino IDE
+ * 2. Tools → Board → Arduino Uno (Vega Aries compatible)
+ * 3. Tools → Port → Select your COM port (Windows) or /dev/ttyUSB* (Linux)
+ * 4. Click Upload button
+ * 5. Open Serial Monitor (Ctrl+Shift+M) at 9600 baud
+ * 6. Follow calibration instructions in Serial Monitor
+ * 
+ * Author: Li-Fi Alert System
+ * Version: 1.0 - Vega Aries Optimized
+ * License: MIT
+ * Date: February 2026
+ */
+
+// ==================== PIN CONFIGURATION ====================
+const int LDR_PIN = A0;           // Analog pin A0 for LDR
+                                  // 10-bit ADC: reads 0 (dark) to 1023 (bright)
+
+// ==================== TIMING CONFIGURATION ====================
+const int BIT_DURATION = 10;      // Must match transmitter (10ms = 100 bps)
+const int SAMPLE_DELAY = 2;       // Sampling delay within bit period
+const int MAX_MESSAGE_LENGTH = 100; // Maximum characters per message
+
+// ==================== CALIBRATION ====================
+// These values are set during automatic calibration
+int darkValue = 0;                // LDR reading in complete darkness
+int lightValue = 1023;            // LDR reading under LED light
+int dynamicThreshold = 512;       // Calculated decision threshold
+
+// For manual threshold (if auto-calibration doesn't work):
+// Uncomment the line below and adjust value (0-1023)
+// #define MANUAL_THRESHOLD 512
+
+// ==================== STATISTICS ====================
+unsigned long messagesReceived = 0;  // Total messages decoded
+unsigned long bytesReceived = 0;     // Total bytes received
+unsigned long startDetections = 0;   // Number of start sequences found
+
+// ==================== SETUP FUNCTION ====================
+void setup() {
+  // Initialize LDR analog input pin
+  pinMode(LDR_PIN, INPUT);
+  
+  // Initialize serial communication for debugging
+  Serial.begin(9600);
+  
+  // Print startup banner
+  Serial.println(F("============================================"));
+  Serial.println(F("  Li-Fi Receiver - Vega Aries Board"));
+  Serial.println(F("  Made in India | RISC-V Based"));
+  Serial.println(F("============================================"));
+  Serial.println();
+  
+  // Print hardware information
+  Serial.println(F("Hardware Configuration:"));
+  Serial.println(F("  Board: Vega Aries (RISC-V ET1031)"));
+  Serial.print(F("  LDR Pin: Analog A"));
+  Serial.println(LDR_PIN - A0);  // Print as A0, A1, etc.
+  Serial.print(F("  Data Rate: "));
+  Serial.print(1000 / BIT_DURATION);
+  Serial.println(F(" bps"));
+  Serial.print(F("  ADC Resolution: 10-bit (0-1023)"));
+  Serial.println();
+  Serial.println();
+  
+  // Perform automatic calibration
+  Serial.println(F("============================================"));
+  Serial.println(F("  CALIBRATION REQUIRED"));
+  Serial.println(F("============================================"));
+  Serial.println(F("This will measure LDR response to light."));
+  Serial.println(F("Please follow instructions carefully."));
+  Serial.println();
+  
+  calibrateSensor();
+  
+  // Print ready message
+  Serial.println();
+  Serial.println(F("============================================"));
+  Serial.println(F("  READY TO RECEIVE MESSAGES"));
+  Serial.println(F("============================================"));
+  Serial.println(F("Setup Instructions:"));
+  Serial.println(F("  1. Position transmitter LED facing LDR"));
+  Serial.println(F("  2. Distance: 10-30 cm (start closer)"));
+  Serial.println(F("  3. Direct line of sight (no obstacles)"));
+  Serial.println(F("  4. Shield LDR from room lights if needed"));
+  Serial.println();
+  Serial.println(F("Waiting for transmissions..."));
+  Serial.println(F("--------------------------------------------\n"));
+}
+
+// ==================== MAIN LOOP ====================
+void loop() {
+  // Continuously scan for start sequence
+  if (detectStartSequence()) {
+    startDetections++;
+    
+    // Start sequence detected! Receive the message
+    String receivedMessage = receiveMessage();
+    
+    // Display received message if valid
+    if (receivedMessage.length() > 0) {
+      messagesReceived++;
+      
+      // Print message with formatting
+      Serial.println(F("============================================"));
+      Serial.print(F("MESSAGE #"));
+      Serial.print(messagesReceived);
+      Serial.print(F(" RECEIVED"));
+      Serial.println();
+      Serial.println(F("============================================"));
+      
+      Serial.print(F("Content: \""));
+      Serial.print(receivedMessage);
+      Serial.println(F("\""));
+      
+      Serial.print(F("Length: "));
+      Serial.print(receivedMessage.length());
+      Serial.println(F(" characters"));
+      
+      Serial.print(F("Bytes: "));
+      Serial.println(bytesReceived);
+      
+      Serial.println(F("============================================\n"));
+    } else {
+      // Empty message received (might be error)
+      Serial.println(F("[WARNING] Empty message received"));
+      Serial.println();
+    }
+  }
+  
+  // Small delay to prevent CPU overload
+  delay(10);
+}
+
+// ==================== CALIBRATION FUNCTIONS ====================
+
+/**
+ * Automatic sensor calibration
+ * Measures dark and light values to calculate optimal threshold
+ */
+void calibrateSensor() {
+  
+  // ===== STEP 1: Measure DARK value =====
+  Serial.println(F("STEP 1: Measure DARK Value"));
+  Serial.println(F("--------------------------------------------"));
+  Serial.println(F(">>> COVER THE LDR COMPLETELY <<<"));
+  Serial.println(F("Use your hand or black tape to block light"));
+  Serial.println();
+  Serial.println(F("Starting measurement in:"));
+  
+  // Countdown for user preparation
+  for (int i = 3; i > 0; i--) {
+    Serial.print(F("  "));
+    Serial.print(i);
+    Serial.println(F(" seconds..."));
+    delay(1000);
+  }
+  Serial.println(F("  Measuring now!"));
+  Serial.println();
+  
+  // Take multiple samples and average (reduces noise)
+  long darkSum = 0;
+  const int numSamples = 100;
+  
+  for (int i = 0; i < numSamples; i++) {
+    darkSum += analogRead(LDR_PIN);
+    delay(10);
+  }
+  darkValue = darkSum / numSamples;
+  
+  Serial.print(F("✓ Dark value measured: "));
+  Serial.println(darkValue);
+  Serial.println();
+  
+  delay(1000);  // Brief pause before next step
+  
+  // ===== STEP 2: Measure LIGHT value =====
+  Serial.println(F("STEP 2: Measure LIGHT Value"));
+  Serial.println(F("--------------------------------------------"));
+  Serial.println(F(">>> POINT TRANSMITTER LED AT LDR <<<"));
+  Serial.println(F("Turn ON transmitter and aim LED at LDR"));
+  Serial.println(F("Or use bright flashlight/phone torch"));
+  Serial.println();
+  Serial.println(F("Starting measurement in:"));
+  
+  // Countdown for user preparation
+  for (int i = 3; i > 0; i--) {
+    Serial.print(F("  "));
+    Serial.print(i);
+    Serial.println(F(" seconds..."));
+    delay(1000);
+  }
+  Serial.println(F("  Measuring now!"));
+  Serial.println();
+  
+  // Take multiple samples and average
+  long lightSum = 0;
+  
+  for (int i = 0; i < numSamples; i++) {
+    lightSum += analogRead(LDR_PIN);
+    delay(10);
+  }
+  lightValue = lightSum / numSamples;
+  
+  Serial.print(F("✓ Light value measured: "));
+  Serial.println(lightValue);
+  Serial.println();
+  
+  // ===== STEP 3: Calculate threshold =====
+  // Threshold is midpoint between dark and light
+  dynamicThreshold = (darkValue + lightValue) / 2;
+  
+  // Display calibration results
+  Serial.println(F("============================================"));
+  Serial.println(F("  CALIBRATION COMPLETE!"));
+  Serial.println(F("============================================"));
+  Serial.print(F("Dark Value:      "));
+  Serial.println(darkValue);
+  Serial.print(F("Light Value:     "));
+  Serial.println(lightValue);
+  Serial.print(F("Threshold:       "));
+  Serial.println(dynamicThreshold);
+  Serial.print(F("Contrast Range:  "));
+  Serial.println(lightValue - darkValue);
+  
+  // Validate calibration quality
+  int contrastRange = lightValue - darkValue;
+  
+  if (contrastRange < 50) {
+    // Very poor contrast - will likely fail
+    Serial.println();
+    Serial.println(F("⚠️  CRITICAL: Very low contrast!"));
+    Serial.println(F("Reception will likely fail."));
+    Serial.println();
+    Serial.println(F("Solutions:"));
+    Serial.println(F("  - Use brighter LED"));
+    Serial.println(F("  - Reduce distance to 5-10 cm"));
+    Serial.println(F("  - Completely block ambient light"));
+    Serial.println(F("  - Try different LDR"));
+  } 
+  else if (contrastRange < 100) {
+    // Poor contrast - may have issues
+    Serial.println();
+    Serial.println(F("⚠️  WARNING: Low contrast"));
+    Serial.println(F("May experience reception errors."));
+    Serial.println();
+    Serial.println(F("Tips:"));
+    Serial.println(F("  - Use brighter LED"));
+    Serial.println(F("  - Reduce distance"));
+    Serial.println(F("  - Shield LDR with tube/straw"));
+  }
+  else if (contrastRange < 200) {
+    // Acceptable contrast
+    Serial.println();
+    Serial.println(F("✓ Calibration acceptable"));
+    Serial.println(F("Should work with good alignment."));
+  }
+  else {
+    // Good contrast
+    Serial.println();
+    Serial.println(F("✓✓ Excellent calibration!"));
+    Serial.println(F("Strong signal expected."));
+  }
+  
+  Serial.println(F("============================================"));
+}
+
+// ==================== DETECTION FUNCTIONS ====================
+
+/**
+ * Detect start sequence (101010 pattern)
+ * Returns true when valid start pattern is found
+ */
+bool detectStartSequence() {
+  int pattern[6];  // Buffer to store last 6 bits
+  int patternIndex = 0;
+  
+  // Scan for start pattern (timeout after 100 attempts)
+  for (int i = 0; i < 100; i++) {
+    
+    // Read one bit from LDR
+    int bitValue = readBit();
+    
+    // Build pattern buffer (circular buffer)
+    if (patternIndex < 6) {
+      // Filling initial buffer
+      pattern[patternIndex++] = bitValue;
+    } else {
+      // Shift left and add new bit at end
+      for (int j = 0; j < 5; j++) {
+        pattern[j] = pattern[j + 1];
+      }
+      pattern[5] = bitValue;
+    }
+    
+    // Check if we have valid alternating pattern: 101010
+    if (patternIndex >= 6) {
+      bool isStartPattern = true;
+      
+      for (int j = 0; j < 6; j++) {
+        // Expected pattern: 1,0,1,0,1,0
+        if (pattern[j] != (j % 2)) {
+          isStartPattern = false;
+          break;
+        }
+      }
+      
+      if (isStartPattern) {
+        Serial.println(F("[RX] Start sequence detected!"));
+        return true;
+      }
+    }
+    
+    // Wait one bit duration before next sample
+    delay(BIT_DURATION);
+  }
+  
+  // No start sequence found
+  return false;
+}
+
+// ==================== RECEPTION FUNCTIONS ====================
+
+/**
+ * Receive complete message after start sequence
+ * Returns decoded message string
+ */
+String receiveMessage() {
+  String message = "";
+  bytesReceived = 0;
+  
+  Serial.println(F("[RX] Receiving message..."));
+  
+  // Receive characters until null terminator
+  while (true) {
+    
+    // Receive one byte (8 bits)
+    char receivedChar = receiveByte();
+    bytesReceived++;
+    
+    // Check for end of message (null character '\0')
+    if (receivedChar == '\0') {
+      Serial.println(F("[RX] End marker detected"));
+      break;
+    }
+    
+    // Add character to message
+    message += receivedChar;
+    
+    // Safety limit to prevent buffer overflow
+    if (message.length() >= MAX_MESSAGE_LENGTH) {
+      Serial.println(F("[RX] Maximum length reached"));
+      break;
+    }
+  }
+  
+  return message;
+}
+
+/**
+ * Receive one byte (8 bits)
+ * Returns decoded character
+ */
+char receiveByte() {
+  byte receivedByte = 0;
+  
+  // Receive 8 bits (MSB first, same as transmitter)
+  for (int bit = 7; bit >= 0; bit--) {
+    
+    // Read one bit
+    int bitValue = readBit();
+    
+    // Set the bit in the byte if it's 1
+    if (bitValue == 1) {
+      receivedByte |= (1 << bit);  // Bitwise OR to set bit
+    }
+    // If bitValue is 0, bit stays 0 (already initialized to 0)
+    
+    // Wait for next bit
+    delay(BIT_DURATION);
+  }
+  
+  return (char)receivedByte;
+}
+
+/**
+ * Read one bit from LDR
+ * Returns 1 (light) or 0 (dark)
+ */
+int readBit() {
+  // Sample the LDR analog value
+  int ldrValue = analogRead(LDR_PIN);
+  
+  // Determine threshold (manual or dynamic)
+  #ifdef MANUAL_THRESHOLD
+    int threshold = MANUAL_THRESHOLD;
+  #else
+    int threshold = dynamicThreshold;
+  #endif
+  
+  // Compare to threshold and return bit value
+  if (ldrValue > threshold) {
+    return 1;  // Light detected (LED was ON)
+  } else {
+    return 0;  // Dark (LED was OFF)
+  }
+}
+
+// ==================== DIAGNOSTICS ====================
+
+/**
+ * Print diagnostic information
+ * Call this from loop() to debug issues
+ */
+/*
+void printDiagnostics() {
+  Serial.println(F("\n============================================"));
+  Serial.println(F("  DIAGNOSTICS"));
+  Serial.println(F("============================================"));
+  Serial.print(F("Messages Received:   "));
+  Serial.println(messagesReceived);
+  Serial.print(F("Start Detections:    "));
+  Serial.println(startDetections);
+  Serial.print(F("Total Bytes:         "));
+  Serial.println(bytesReceived);
+  Serial.print(F("Current LDR Value:   "));
+  Serial.println(analogRead(LDR_PIN));
+  Serial.print(F("Threshold:           "));
+  Serial.println(dynamicThreshold);
+  Serial.print(F("Contrast:            "));
+  Serial.println(lightValue - darkValue);
+  Serial.println(F("============================================\n"));
+}
+*/
+
+// ==================== NOTES FOR VEGA ARIES ====================
+/*
+ * Vega Aries Specific Notes:
+ * 
+ * 1. Analog Input (A0):
+ *    - 10-bit ADC: 0-1023 range
+ *    - Reference voltage: 5V (default)
+ *    - Input impedance: High (use 10kΩ pull-down)
+ * 
+ * 2. LDR Connection:
+ *    - Voltage divider is mandatory
+ *    - Without 10kΩ resistor, readings will be unreliable
+ *    - LDR position: between 5V and A0
+ *    - Resistor position: between A0 and GND
+ * 
+ * 3. Calibration Tips:
+ *    - Do calibration in actual operating environment
+ *    - Re-calibrate if lighting conditions change
+ *    - Manual threshold can be set if auto fails
+ * 
+ * 4. Power Considerations:
+ *    - USB power is most stable
+ *    - External power (7-12V) also works
+ *    - Avoid battery during initial testing
+ * 
+ * 5. Upload Process:
+ *    - Use "Arduino Uno" board setting
+ *    - Check correct COM port selected
+ *    - CH340 drivers needed for USB connection
+ * 
+ * 6. Common Issues:
+ *    - If calibration fails: Check LDR connections
+ *    - If no messages: Re-run calibration
+ *    - If garbled text: Improve LED alignment
+ *    - If random data: Shield LDR from room lights
+ * 
+ * 7. LDR Selection (Indian Market):
+ *    - GL5528: Most common, works well (~₹5-10)
+ *    - GL5537: Faster response (~₹15-20)
+ *    - Available at: Lamington Road (Mumbai), SP Road (Bangalore)
+ * 
+ * 8. Performance:
+ *    - RISC-V timing is accurate
+ *    - No modifications needed for Vega Aries
+ *    - Works same as Arduino Uno
+ */
+
+// ==================== END OF CODE ====================
